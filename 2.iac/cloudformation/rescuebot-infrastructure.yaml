@@ -20,20 +20,11 @@ Mappings:
     dev:
       InstanceType: t3.micro
       DBInstanceClass: db.t3.micro
-      MinSize: 1
-      MaxSize: 2
-      DesiredCapacity: 1
       MultiAZ: false
     prod:
       InstanceType: t3.medium
       DBInstanceClass: db.t3.medium
-      MinSize: 2
-      MaxSize: 5
-      DesiredCapacity: 2
       MultiAZ: true
-
-Conditions:
-  IsProd: !Equals [!Ref Environment, prod]
 
 Resources:
   # VPC
@@ -132,10 +123,10 @@ Resources:
         - Key: Name
           Value: !Sub ${ProjectName}-alb-sg
 
-  EC2SecurityGroup:
+  FlaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for EC2 instances
+      GroupDescription: Security group for Flask app servers
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -148,7 +139,25 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-ec2-sg
+          Value: !Sub ${ProjectName}-flask-sg
+
+  MonitoringSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for monitoring target server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-monitoring-sg
 
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -159,7 +168,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
-          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          SourceSecurityGroupId: !Ref FlaskSecurityGroup
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
@@ -194,6 +203,7 @@ Resources:
                   - logs:CreateLogStream
                   - sns:Publish
                   - secretsmanager:GetSecretValue
+                  - bedrock:InvokeModel
                 Resource: '*'
 
   EC2InstanceProfile:
@@ -274,95 +284,244 @@ Resources:
       PubliclyAccessible: true
       DeletionProtection: false
 
-  # Launch Template
-  LaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
+  # Flask App Instance
+  FlaskAppInstance:
+    Type: AWS::EC2::Instance
     Properties:
-      LaunchTemplateName: !Sub ${ProjectName}-launch-template
-      LaunchTemplateData:
-        ImageId: !Ref LatestAmiId
-        InstanceType: !FindInMap [EnvironmentMap, !Ref Environment, InstanceType]
-        KeyName: !Ref EC2KeyPair
-        IamInstanceProfile:
-          Arn: !GetAtt EC2InstanceProfile.Arn
-        SecurityGroupIds:
-          - !Ref EC2SecurityGroup
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            yum update -y
-            yum install -y docker python3
-            systemctl start docker
-            systemctl enable docker
-            usermod -a -G docker ec2-user
-            
-            # Install CloudWatch Agent
-            wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
-            rpm -U ./amazon-cloudwatch-agent.rpm
-            
-            # Create port check script
-            cat > /opt/check_mysql_port.py << 'EOF'
-            #!/usr/bin/env python3
-            import boto3
-            import socket
-            
-            def check_port_3306():
-                cloudwatch = boto3.client('cloudwatch', region_name='${AWS::Region}')
-                
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(5)
-                    result = sock.connect_ex(('localhost', 3306))
-                    sock.close()
-                    
-                    port_status = 1 if result == 0 else 0
-                    
-                    cloudwatch.put_metric_data(
-                        Namespace='Custom/MySQL',
-                        MetricData=[
-                            {
-                                'MetricName': 'Port3306Status',
-                                'Value': port_status,
-                                'Unit': 'Count'
-                            }
-                        ]
-                    )
-                    print(f"Port 3306 status: {port_status}")
-                except Exception as e:
-                    print(f"Error checking port: {e}")
-            
-            if __name__ == "__main__":
-                check_port_3306()
-            EOF
-            
-            chmod +x /opt/check_mysql_port.py
-            echo "*/1 * * * * /usr/bin/python3 /opt/check_mysql_port.py >> /var/log/port_check.log 2>&1" | crontab -
-            
-            # Run Flask app placeholder
-            docker pull nginx:alpine
-            docker run -d --name rescuebot-app -p 5000:80 nginx:alpine
-
-  # Auto Scaling Group
-  AutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    Properties:
-      VPCZoneIdentifier:
-        - !Ref PublicSubnet1
-        - !Ref PublicSubnet2
-      LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplate
-        Version: !GetAtt LaunchTemplate.LatestVersionNumber
-      MinSize: !FindInMap [EnvironmentMap, !Ref Environment, MinSize]
-      MaxSize: !FindInMap [EnvironmentMap, !Ref Environment, MaxSize]
-      DesiredCapacity: !FindInMap [EnvironmentMap, !Ref Environment, DesiredCapacity]
-      TargetGroupARNs:
-        - !Ref TargetGroup
-      HealthCheckType: ELB
-      HealthCheckGracePeriod: 300
+      ImageId: !Ref LatestAmiId
+      InstanceType: !FindInMap [EnvironmentMap, !Ref Environment, InstanceType]
+      KeyName: !Ref EC2KeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref FlaskSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker python3 git mysql
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # Install pip packages
+          pip3 install flask boto3 pymysql
+          
+          # Create Flask app directory
+          mkdir -p /opt/rescuebot
+          
+          # Create Flask app
+          cat > /opt/rescuebot/app.py << 'EOF'
+          from flask import Flask, request, jsonify
+          import boto3
+          import json
+          import os
+          
+          app = Flask(__name__)
+          
+          @app.route('/health', methods=['GET'])
+          def health():
+              return jsonify({'status': 'healthy'})
+          
+          @app.route('/webhook/cloudwatch', methods=['POST'])
+          def cloudwatch_webhook():
+              data = request.get_json()
+              print(f"Received CloudWatch event: {data}")
+              
+              # Call Bedrock for AI response
+              bedrock = boto3.client('bedrock-runtime', region_name='${AWS::Region}')
+              
+              try:
+                  prompt = f"MySQL service is down on server. Provide troubleshooting steps: {data}"
+                  
+                  response = bedrock.invoke_model(
+                      modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                      body=json.dumps({
+                          "anthropic_version": "bedrock-2023-05-31",
+                          "max_tokens": 1000,
+                          "messages": [
+                              {
+                                  "role": "user",
+                                  "content": prompt
+                              }
+                          ]
+                      })
+                  )
+                  
+                  result = json.loads(response['body'].read())
+                  ai_solution = result['content'][0]['text']
+                  
+                  return jsonify({
+                      'status': 'success',
+                      'ai_solution': ai_solution
+                  })
+              except Exception as e:
+                  return jsonify({'error': str(e)}), 500
+          
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=5000)
+          EOF
+          
+          # Create systemd service
+          cat > /etc/systemd/system/rescuebot.service << 'EOF'
+          [Unit]
+          Description=Rescue Bot Flask App
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/opt/rescuebot
+          ExecStart=/usr/bin/python3 /opt/rescuebot/app.py
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          # Start Flask app
+          systemctl daemon-reload
+          systemctl enable rescuebot
+          systemctl start rescuebot
+          
+          echo "Flask App Server Ready" > /var/log/flask-ready.log
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-instance
-          PropagateAtLaunch: true
+          Value: !Sub ${ProjectName}-flask-server
+
+  # Monitoring Target Server
+  MonitoringTargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !FindInMap [EnvironmentMap, !Ref Environment, InstanceType]
+      KeyName: !Ref EC2KeyPair
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref MonitoringSecurityGroup
+      SubnetId: !Ref PublicSubnet2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y mysql-server python3
+          
+          # Start MySQL
+          systemctl start mysqld
+          systemctl enable mysqld
+          
+          # Set MySQL root password
+          mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'password123';"
+          mysql -u root -ppassword123 -e "CREATE DATABASE IF NOT EXISTS testdb;"
+          mysql -u root -ppassword123 -e "CREATE USER 'testuser'@'%' IDENTIFIED BY 'testpass';"
+          mysql -u root -ppassword123 -e "GRANT ALL PRIVILEGES ON testdb.* TO 'testuser'@'%';"
+          mysql -u root -ppassword123 -e "FLUSH PRIVILEGES;"
+          
+          # Configure MySQL for remote access
+          sed -i 's/bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+          systemctl restart mysqld
+          
+          # Install CloudWatch Agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          rpm -U ./amazon-cloudwatch-agent.rpm
+          
+          # CloudWatch Agent Configuration
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": ["cpu_usage_idle", "cpu_usage_iowait"],
+                  "metrics_collection_interval": 60
+                },
+                "netstat": {
+                  "measurement": ["tcp_established", "tcp_listen"],
+                  "metrics_collection_interval": 60
+                },
+                "procstat": [
+                  {
+                    "pattern": "mysqld",
+                    "measurement": ["cpu_usage", "memory_rss", "pid_count"]
+                  }
+                ]
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/port_check.log",
+                      "log_group_name": "/aws/ec2/rescuebot",
+                      "log_stream_name": "{instance_id}"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch Agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+          
+          # Create port check script
+          cat > /opt/check_mysql_port.py << 'EOF'
+          #!/usr/bin/env python3
+          import boto3
+          import socket
+          import requests
+          
+          def check_port_3306():
+              cloudwatch = boto3.client('cloudwatch', region_name='${AWS::Region}')
+              
+              # Get instance ID
+              try:
+                  instance_id = requests.get('http://169.254.169.254/latest/meta-data/instance-id', timeout=2).text
+              except:
+                  instance_id = 'unknown'
+              
+              try:
+                  sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                  sock.settimeout(5)
+                  result = sock.connect_ex(('localhost', 3306))
+                  sock.close()
+                  
+                  port_status = 1 if result == 0 else 0
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='Custom/MySQL',
+                      MetricData=[
+                          {
+                              'MetricName': 'Port3306Status',
+                              'Value': port_status,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {
+                                      'Name': 'InstanceId',
+                                      'Value': instance_id
+                                  }
+                              ]
+                          }
+                      ]
+                  )
+                  print(f"Port 3306 status: {port_status} for instance: {instance_id}")
+              except Exception as e:
+                  print(f"Error checking port: {e}")
+          
+          if __name__ == "__main__":
+              check_port_3306()
+          EOF
+          
+          chmod +x /opt/check_mysql_port.py
+          echo "*/1 * * * * /usr/bin/python3 /opt/check_mysql_port.py >> /var/log/port_check.log 2>&1" | crontab -
+          
+          echo "Monitoring Server Ready" > /var/log/monitoring-ready.log
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-monitoring-target
 
   # Application Load Balancer
   ApplicationLoadBalancer:
@@ -384,7 +543,10 @@ Resources:
       Port: 5000
       Protocol: HTTP
       VpcId: !Ref VPC
-      HealthCheckPath: /
+      Targets:
+        - Id: !Ref FlaskAppInstance
+          Port: 5000
+      HealthCheckPath: /health
       HealthCheckProtocol: HTTP
       HealthCheckIntervalSeconds: 30
       HealthyThresholdCount: 2
@@ -422,7 +584,7 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
-  # Lambda Function
+  # Lambda Function for Alert Handling
   AlertHandlerFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -450,16 +612,23 @@ Resources:
               
               message = {
                   "alert": "MySQL Port 3306 Down",
-                  "server": "unknown",
+                  "server": event.get('detail', {}).get('dimensions', {}).get('InstanceId', 'unknown'),
                   "timestamp": event.get('time', 'unknown')
               }
               
               try:
+                  # Send SNS notification
                   sns.publish(
                       TopicArn=os.environ['SNS_TOPIC_ARN'],
                       Message=json.dumps(message),
                       Subject="MySQL Alert - Port Down"
                   )
+                  
+                  # Call Flask API webhook
+                  flask_url = f"{os.environ['FLASK_API_URL']}/webhook/cloudwatch"
+                  response = http.request('POST', flask_url, 
+                                        body=json.dumps(message),
+                                        headers={'Content-Type': 'application/json'})
                   
                   return {
                       'statusCode': 200,
@@ -467,6 +636,54 @@ Resources:
                   }
               except Exception as e:
                   print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+
+  # Bedrock Lambda Function
+  BedrockChatFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-bedrock-chat
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              bedrock = boto3.client('bedrock-runtime')
+              
+              try:
+                  prompt = event.get('prompt', 'Hello, how can I help with MySQL troubleshooting?')
+                  
+                  response = bedrock.invoke_model(
+                      modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                      body=json.dumps({
+                          "anthropic_version": "bedrock-2023-05-31",
+                          "max_tokens": 1000,
+                          "messages": [
+                              {
+                                  "role": "user",
+                                  "content": prompt
+                              }
+                          ]
+                      })
+                  )
+                  
+                  result = json.loads(response['body'].read())
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'response': result['content'][0]['text']
+                      })
+                  }
+              except Exception as e:
                   return {
                       'statusCode': 500,
                       'body': json.dumps(f'Error: {str(e)}')
@@ -493,7 +710,7 @@ Resources:
         - Arn: !GetAtt AlertHandlerFunction.Arn
           Id: MySQLAlertLambdaTarget
 
-  # Lambda Permission
+  # Lambda Permissions
   LambdaInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -511,18 +728,34 @@ Outputs:
     Description: Load Balancer DNS name
     Value: !GetAtt ApplicationLoadBalancer.DNSName
 
+  FlaskAppURL:
+    Description: Flask application URL
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
   RDSEndpoint:
     Description: RDS endpoint
     Value: !GetAtt RDSInstance.Endpoint.Address
 
-  SNSTopicArn:
-    Description: SNS Topic ARN for alerts
-    Value: !Ref AlertsTopic
+  FlaskInstanceId:
+    Description: Flask server instance ID
+    Value: !Ref FlaskAppInstance
 
-  EC2KeyPairId:
-    Description: EC2 Key Pair ID for SSH access
-    Value: !Ref EC2KeyPair
+  FlaskInstanceIP:
+    Description: Flask server public IP
+    Value: !GetAtt FlaskAppInstance.PublicIpAddress
+
+  MonitoringInstanceId:
+    Description: Monitoring target instance ID
+    Value: !Ref MonitoringTargetInstance
+
+  MonitoringInstanceIP:
+    Description: Monitoring target instance public IP
+    Value: !GetAtt MonitoringTargetInstance.PublicIpAddress
+
+  BedrockChatFunctionArn:
+    Description: Bedrock Chat Lambda function ARN
+    Value: !GetAtt BedrockChatFunction.Arn
 
   MySQLConnectionCommand:
-    Description: MySQL connection command
-    Value: !Sub 'mysql -h ${RDSInstance.Endpoint.Address} -P 3306 -u admin -p rescuebot'
+    Description: Connect to monitoring target MySQL
+    Value: !Sub 'mysql -h ${MonitoringTargetInstance.PublicIpAddress} -P 3306 -u root -p'
