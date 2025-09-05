@@ -306,8 +306,8 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          dnf update -y
-          dnf install -y mariadb105-server python3 git
+          yum update -y
+          yum install -y mariadb-server python3 git
           
           # Start MariaDB
           systemctl start mariadb
@@ -481,8 +481,8 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          dnf update -y
-          dnf install -y mariadb105-server python3
+          yum update -y
+          yum install -y mariadb-server python3
           
           # Start MariaDB
           systemctl start mariadb
