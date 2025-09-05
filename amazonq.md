@@ -107,7 +107,6 @@
 
 **성능**:
 - [x] 이벤트 테이블 인덱싱 (server_id, event_time, severity)
-- [x] Redis 캐싱 (자주 조회되는 통계 데이터)
 - [x] 페이징 처리 (기본 50개씩)
 - [x] 비동기 SaltStack 명령어 실행
 
