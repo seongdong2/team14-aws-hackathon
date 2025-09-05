@@ -137,6 +137,10 @@ Resources:
           FromPort: 22
           ToPort: 22
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
           Value: !Sub ${ProjectName}-flask-sg
@@ -176,6 +180,8 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${ProjectName}-rds-sg
+
+
 
   # IAM Roles
   EC2Role:
@@ -284,6 +290,8 @@ Resources:
       PubliclyAccessible: true
       DeletionProtection: false
 
+
+
   # Flask App Instance
   FlaskAppInstance:
     Type: AWS::EC2::Instance
@@ -299,13 +307,25 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           yum update -y
-          yum install -y docker python3 git mysql
-          systemctl start docker
-          systemctl enable docker
-          usermod -a -G docker ec2-user
+          yum install -y mysql-server python3 git
+          
+          # Start MySQL
+          systemctl start mysqld
+          systemctl enable mysqld
+          
+          # Set MySQL root password
+          mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'flaskdb123';"
+          mysql -u root -pflaskdb123 -e "CREATE DATABASE IF NOT EXISTS rescuebot;"
+          mysql -u root -pflaskdb123 -e "CREATE USER 'rescuebot'@'%' IDENTIFIED BY 'rescuebot123';"
+          mysql -u root -pflaskdb123 -e "GRANT ALL PRIVILEGES ON rescuebot.* TO 'rescuebot'@'%';"
+          mysql -u root -pflaskdb123 -e "FLUSH PRIVILEGES;"
+          
+          # Configure MySQL for remote access
+          sed -i 's/bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+          systemctl restart mysqld
           
           # Install pip packages
-          pip3 install flask boto3 pymysql
+          pip3 install flask boto3 pymysql flask-sqlalchemy
           
           # Create Flask app directory
           mkdir -p /opt/rescuebot
@@ -313,26 +333,56 @@ Resources:
           # Create Flask app
           cat > /opt/rescuebot/app.py << 'EOF'
           from flask import Flask, request, jsonify
+          from flask_sqlalchemy import SQLAlchemy
           import boto3
           import json
           import os
+          from datetime import datetime
           
           app = Flask(__name__)
+          # Use both local MySQL and RDS
+          app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://rescuebot:rescuebot123@localhost/rescuebot'
+          app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+          
+          db = SQLAlchemy(app)
+          
+          # Database Models
+          class CloudWatchEvent(db.Model):
+              id = db.Column(db.Integer, primary_key=True)
+              event_source = db.Column(db.String(100))
+              event_type = db.Column(db.String(50))
+              severity = db.Column(db.String(20))
+              server_id = db.Column(db.String(50))
+              event_message = db.Column(db.Text)
+              event_time = db.Column(db.DateTime, default=datetime.utcnow)
+              status = db.Column(db.String(20), default='new')
           
           @app.route('/health', methods=['GET'])
           def health():
-              return jsonify({'status': 'healthy'})
+              return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()})
           
           @app.route('/webhook/cloudwatch', methods=['POST'])
           def cloudwatch_webhook():
-              data = request.get_json()
-              print(f"Received CloudWatch event: {data}")
-              
-              # Call Bedrock for AI response
-              bedrock = boto3.client('bedrock-runtime', region_name='${AWS::Region}')
-              
               try:
-                  prompt = f"MySQL service is down on server. Provide troubleshooting steps: {data}"
+                  data = request.get_json()
+                  print(f"Received CloudWatch event: {data}")
+                  
+                  # Save event to database
+                  event = CloudWatchEvent(
+                      event_source=data.get('source', 'cloudwatch'),
+                      event_type=data.get('alert', 'mysql_down'),
+                      severity='critical',
+                      server_id=data.get('server', 'unknown'),
+                      event_message=str(data),
+                      status='processing'
+                  )
+                  db.session.add(event)
+                  db.session.commit()
+                  
+                  # Call Bedrock for AI response
+                  bedrock = boto3.client('bedrock-runtime', region_name='${AWS::Region}')
+                  
+                  prompt = f"MySQL service is down on server {data.get('server', 'unknown')}. Provide step-by-step troubleshooting guide."
                   
                   response = bedrock.invoke_model(
                       modelId='anthropic.claude-3-sonnet-20240229-v1:0',
@@ -351,22 +401,45 @@ Resources:
                   result = json.loads(response['body'].read())
                   ai_solution = result['content'][0]['text']
                   
+                  # Update event status
+                  event.status = 'resolved'
+                  db.session.commit()
+                  
                   return jsonify({
                       'status': 'success',
+                      'event_id': event.id,
                       'ai_solution': ai_solution
                   })
               except Exception as e:
+                  print(f"Error: {str(e)}")
                   return jsonify({'error': str(e)}), 500
           
+          @app.route('/events', methods=['GET'])
+          def get_events():
+              events = CloudWatchEvent.query.order_by(CloudWatchEvent.event_time.desc()).limit(50).all()
+              return jsonify([
+                  {
+                      'id': e.id,
+                      'event_type': e.event_type,
+                      'severity': e.severity,
+                      'server_id': e.server_id,
+                      'event_time': e.event_time.isoformat(),
+                      'status': e.status
+                  } for e in events
+              ])
+          
           if __name__ == '__main__':
-              app.run(host='0.0.0.0', port=5000)
+              with app.app_context():
+                  db.create_all()
+              app.run(host='0.0.0.0', port=5000, debug=True)
           EOF
           
           # Create systemd service
           cat > /etc/systemd/system/rescuebot.service << 'EOF'
           [Unit]
           Description=Rescue Bot Flask App
-          After=network.target
+          After=network.target mysqld.service
+          Requires=mysqld.service
           
           [Service]
           Type=simple
@@ -374,6 +447,7 @@ Resources:
           WorkingDirectory=/opt/rescuebot
           ExecStart=/usr/bin/python3 /opt/rescuebot/app.py
           Restart=always
+          RestartSec=10
           
           [Install]
           WantedBy=multi-user.target
@@ -384,7 +458,7 @@ Resources:
           systemctl enable rescuebot
           systemctl start rescuebot
           
-          echo "Flask App Server Ready" > /var/log/flask-ready.log
+          echo "Flask App Server with MySQL Ready" > /var/log/flask-ready.log
       Tags:
         - Key: Name
           Value: !Sub ${ProjectName}-flask-server
@@ -736,13 +810,21 @@ Outputs:
     Description: RDS endpoint
     Value: !GetAtt RDSInstance.Endpoint.Address
 
+  FlaskMySQLCommand:
+    Description: Connect to Flask server MySQL
+    Value: !Sub 'mysql -h ${FlaskAppInstance.PublicIp} -P 3306 -u rescuebot -p'
+
+  RDSMySQLCommand:
+    Description: Connect to RDS MySQL
+    Value: !Sub 'mysql -h ${RDSInstance.Endpoint.Address} -P 3306 -u admin -p'
+
   FlaskInstanceId:
     Description: Flask server instance ID
     Value: !Ref FlaskAppInstance
 
   FlaskInstanceIP:
     Description: Flask server public IP
-    Value: !GetAtt FlaskAppInstance.PublicIpAddress
+    Value: !GetAtt FlaskAppInstance.PublicIp
 
   MonitoringInstanceId:
     Description: Monitoring target instance ID
@@ -750,7 +832,7 @@ Outputs:
 
   MonitoringInstanceIP:
     Description: Monitoring target instance public IP
-    Value: !GetAtt MonitoringTargetInstance.PublicIpAddress
+    Value: !GetAtt MonitoringTargetInstance.PublicIp
 
   BedrockChatFunctionArn:
     Description: Bedrock Chat Lambda function ARN
@@ -758,4 +840,12 @@ Outputs:
 
   MySQLConnectionCommand:
     Description: Connect to monitoring target MySQL
-    Value: !Sub 'mysql -h ${MonitoringTargetInstance.PublicIpAddress} -P 3306 -u root -p'
+    Value: !Sub 'mysql -h ${MonitoringTargetInstance.PublicIp} -P 3306 -u root -p'
+
+  FlaskMySQLPassword:
+    Description: Flask MySQL password
+    Value: 'rescuebot123'
+
+  MonitoringMySQLPassword:
+    Description: Monitoring MySQL password
+    Value: 'password123'
