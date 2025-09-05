@@ -47,7 +47,7 @@ rescuebot은 해당 서버의 상태 체크한 부분 (예를 들면 systemctl s
 
 ⭐AWS에서 대체할 제품 찾기
 
-1.ESM처럼 EC2에 올라가있는 mysql이 죽었을 경우 알람을 발생시켜주는 제품 ➡
+1.cloud EC2에 올라가있는 mysql이 죽었을 경우 알람을 발생시켜주는 제품 ➡
 2.recuebot에 올라가있는 flask처럼 중앙 관리 서버 역할을 할 제품 ➡
 3.slack으로 연결시켜줄수있는 제품 ➡
 4.hchat 제품 ➡
