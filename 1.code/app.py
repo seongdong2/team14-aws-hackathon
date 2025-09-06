@@ -55,10 +55,9 @@ def get_salt_token():
         print(f"Salt token error: {e}")
     return None
 
-def execute_salt_command(target, function, args=None):
+def execute_salt_command(target, function, args=None, timeout=10):
     """SaltStack 명령어 실행"""
     token = get_salt_token()
-    print(f"Salt token: {token}")
     if not token:
         return {'error': 'Failed to get Salt token'}
     
@@ -72,9 +71,13 @@ def execute_salt_command(target, function, args=None):
         data['arg'] = args
     
     try:
-        response = requests.post(f'{SALT_API_URL}/', json=data, headers=headers)
-        print(f"Salt command response: {response.text}")
-        return response.json() if response.status_code == 200 else {'error': 'Command failed'}
+        response = requests.post(f'{SALT_API_URL}/', json=data, headers=headers, timeout=timeout)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return {'error': f'Command failed with status {response.status_code}'}
+    except requests.exceptions.Timeout:
+        return {'error': f'Request timeout after {timeout} seconds'}
     except Exception as e:
         return {'error': str(e)}
 
@@ -280,14 +283,54 @@ class CloudWatchWebhook(Resource):
 @api.route('/api/salt/minions')
 class SaltMinions(Resource):
     def get(self):
-        """Get all Salt minions"""
-        result = execute_salt_command('*', 'test.ping')
-        print(f"Salt minions result: {result}")
-        if 'error' in result:
-            return result, 500
-        
-        minions = list(result.get('return', [{}])[0].keys()) if result.get('return') else []
-        return {'minions': minions}
+        """Get all Salt minions with detailed info"""
+        try:
+            grains_result = execute_salt_command('*', 'grains.items', timeout=10)
+            if 'error' in grains_result:
+                return grains_result, 500
+            
+            grains_data = grains_result.get('return', [{}])[0] if grains_result.get('return') else {}
+            
+            minion_info = []
+            for minion_id, grains in grains_data.items():
+                minion_data = {
+                    'minion_id': minion_id,
+                    'fqdn': grains.get('fqdn', 'unknown'),
+                    'host': grains.get('host', 'unknown'),
+                    'ip4_interfaces': grains.get('ip4_interfaces', {}),
+                    'os': grains.get('os', 'unknown'),
+                    'status': 'online'
+                }
+                minion_info.append(minion_data)
+            
+            return {'minions': minion_info}
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+@api.route('/api/salt/minions/fqdn/<fqdn>/id')
+class SaltMinionIdByFQDN(Resource):
+    def get(self, fqdn):
+        """Get minion ID by FQDN"""
+        try:
+            grains_result = execute_salt_command('*', 'grains.items', timeout=10)
+            if 'error' in grains_result:
+                return grains_result, 500
+            
+            grains_data = grains_result.get('return', [{}])[0] if grains_result.get('return') else {}
+            
+            for minion_id, grains in grains_data.items():
+                minion_fqdn = grains.get('fqdn', '')
+                if minion_fqdn == fqdn:
+                    return {
+                        'fqdn': fqdn,
+                        'minion_id': minion_id,
+                        'host': grains.get('host', 'unknown'),
+                        'ip_addresses': grains.get('ip4_interfaces', {})
+                    }
+            
+            return {'error': f'No minion found with FQDN: {fqdn}'}, 404
+        except Exception as e:
+            return {'error': str(e)}, 500
 
 @api.route('/api/salt/execute')
 class SaltExecute(Resource):
@@ -343,6 +386,161 @@ class MySQLRestart(Resource):
         target = request.args.get('target', '*')
         result = execute_salt_command(target, 'service.restart', ['mysql'])
         return result
+
+@api.route('/api/salt/jobs')
+class SaltJobs(Resource):
+    def get(self):
+        """Get Salt jobs using simple approach"""
+        try:
+            # Get running jobs first with short timeout
+            running_result = execute_salt_command('*', 'saltutil.running', timeout=5)
+            if 'error' in running_result:
+                print(f"Salt running command error: {running_result['error']}")
+                # Continue with empty running jobs if salt command fails
+                jobs_data = {}
+            else:
+                jobs_data = running_result.get('return', [{}])[0] if running_result.get('return') else {}
+            
+            running_jobs = []
+            
+            for minion_id, jobs in jobs_data.items():
+                if jobs:
+                    for job in jobs:
+                        running_jobs.append({
+                            'jid': job.get('jid'),
+                            'minion_id': minion_id,
+                            'function': job.get('fun'),
+                            'target': job.get('tgt'),
+                            'status': 'running',
+                            'pid': job.get('pid')
+                        })
+            
+            # Try to get job history from database logs
+            try:
+                connection = get_db_connection()
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT target_minion, function_name, executed_at FROM salt_execution_logs ORDER BY executed_at DESC LIMIT 10"
+                    )
+                    db_logs = cursor.fetchall()
+                connection.close()
+                
+                completed_jobs = []
+                for log in db_logs:
+                    completed_jobs.append({
+                        'minion_id': log[0],
+                        'function': log[1],
+                        'executed_at': log[2].isoformat() if log[2] else None,
+                        'status': 'completed'
+                    })
+            except Exception as e:
+                print(f"Database error: {e}")
+                completed_jobs = []
+            
+            return {
+                'running_jobs': running_jobs,
+                'recent_completed_jobs': completed_jobs,
+                'running_count': len(running_jobs),
+                'completed_count': len(completed_jobs),
+                'salt_error': running_result.get('error') if 'error' in running_result else None
+            }
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+@api.route('/api/salt/jobs/active')
+class SaltActiveJobs(Resource):
+    @api.param('timeout', 'Request timeout in seconds', type=int, default=5)
+    def get(self):
+        """Get currently running Salt jobs with timeout control"""
+        timeout = request.args.get('timeout', 5, type=int)
+        
+        try:
+            result = execute_salt_command('*', 'saltutil.running', timeout=timeout)
+            if 'error' in result:
+                return {
+                    'error': result['error'],
+                    'running_jobs': [],
+                    'minions_status': {},
+                    'count': 0,
+                    'timeout_used': timeout
+                }, 500
+            
+            active_jobs = []
+            jobs_data = result.get('return', [{}])[0] if result.get('return') else {}
+            
+            for minion_id, jobs in jobs_data.items():
+                if jobs:  # If minion has active jobs
+                    for job in jobs:
+                        active_jobs.append({
+                            'minion_id': minion_id,
+                            'jid': job.get('jid'),
+                            'fun': job.get('fun'),
+                            'pid': job.get('pid'),
+                            'tgt': job.get('tgt'),
+                            'tgt_type': job.get('tgt_type')
+                        })
+            
+            return {
+                'running_jobs': active_jobs,
+                'minions_status': jobs_data,
+                'count': len(active_jobs),
+                'timeout_used': timeout
+            }
+        except Exception as e:
+            return {
+                'error': str(e),
+                'running_jobs': [],
+                'minions_status': {},
+                'count': 0,
+                'timeout_used': timeout
+            }, 500
+
+@api.route('/api/salt/jobs/<jid>')
+class SaltJobDetail(Resource):
+    def get(self, jid):
+        """Get Salt job detail by JID"""
+        try:
+            # Check if job is still running
+            running_result = execute_salt_command('*', 'saltutil.find_job', [jid])
+            if 'error' in running_result:
+                return running_result, 500
+            
+            running_info = running_result.get('return', [{}])[0] if running_result.get('return') else {}
+            is_running = bool(running_info)
+            
+            if is_running:
+                return {
+                    'jid': jid,
+                    'status': 'running',
+                    'running_info': running_info,
+                    'is_running': True
+                }
+            else:
+                return {
+                    'jid': jid,
+                    'status': 'completed or not found',
+                    'running_info': {},
+                    'is_running': False,
+                    'message': 'Job not found in running jobs. It may have completed or never existed.'
+                }
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+@api.route('/api/salt/jobs/<jid>/kill')
+class SaltJobKill(Resource):
+    def post(self, jid):
+        """Kill Salt job by JID"""
+        result = execute_salt_command('*', 'saltutil.kill_job', [jid])
+        if 'error' in result:
+            return result, 500
+        
+        kill_results = result.get('return', [{}])[0] if result.get('return') else {}
+        
+        return {
+            'jid': jid,
+            'kill_results': kill_results,
+            'success': any(kill_results.values()) if kill_results else False
+        }
 
 @api.route('/api/salt/logs')
 class SaltExecutionLogs(Resource):
