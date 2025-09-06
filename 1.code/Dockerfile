@@ -16,4 +16,4 @@ COPY . .
 
 EXPOSE 3000
 
-CMD ["python", "app_merged.py"]
+CMD ["python", "app.py"]
